@@ -5,8 +5,9 @@ next to it: {"<id>": {"name": str, "ramp": [[r,g,b] x 4, dark -> light], "emissi
 Legacy input: `--strip slices.png --count N` (colour-only slices; each colour becomes a flat material).
 
 Per frame, all at 1x art pixels:
-  * stack the slices bottom to top (rotate by the turn, squash y for pitch, lift 1 px per slice) into an
-    index buffer: for each screen pixel the voxel drawn there. Painting by z is exact depth order for this
+  * stack the slices bottom to top (rotate by the turn, squash y for pitch, lift `spacing` px per slice) into an
+    index buffer. Each slice is sampled at `substeps` fractional heights (lowest first) so it acts as a slab
+    and thin parts do not break into stripes at low pitch; --substeps 1 is the old one-sample behaviour: for each screen pixel the voxel drawn there. Painting by z is exact depth order for this
     projection (a higher voxel landing on the same pixel is always nearer the camera).
   * from that buffer: material, height (slice), depth toward the camera, surface normal, occlusion.
   * light: normals rotated by the turn, lit by a lamp fixed in screen space, quantised to 4 ramp steps;
@@ -172,6 +173,7 @@ class Config:
     frames: int = 48
     squash: float = 0.6
     spacing: float = 1.0
+    substeps: int = 0                     # samples per slice; 0 = auto_substeps(squash, spacing), 1 = v1 behaviour
     scale: int = 4
     fps: float = 12
     # lamp in camera space: (right, up on screen, toward viewer)
@@ -226,6 +228,7 @@ class Prepared:
         self.ground = (pad + diag // 2, self.ch - pad - int(math.ceil(diag * cfg.squash / 2)))
         self.lifts = [int(math.floor(z * cfg.spacing + 0.5)) for z in range(self.n)]
         self.nonempty = [z for z in range(self.n) if occ[z].any()]
+        self.substeps = cfg.substeps if cfg.substeps > 0 else auto_substeps(cfg.squash, cfg.spacing)
         # light in model-upright screen frame (x right, y' toward viewer, z up)
         q, sp = cfg.squash, cfg.spacing
         hn = math.hypot(q, sp)
@@ -238,6 +241,28 @@ class Prepared:
 
 
 # ------------------------------------------------------------------------------------------ frame
+def _source_offsets(u, v, cx, cy, sw, sh):
+    """Flat in-slice voxel offset (y * sw + x) read by each screen pixel, -1 outside the grid.
+
+    u, v are measured from the grid centre. A sample that lands on a voxel boundary (within 1e-4) goes to the
+    voxel nearer the centre. v1 always rounded such ties up (floor(t + 1e-4)), which tips opposite ways at 0 and
+    180 degrees, so a model could gain a row at one and lose it at the other; this rule is mirror-symmetric."""
+    ui = _toward_centre(u, cx)
+    vi = _toward_centre(v, cy)
+    ok = (ui >= 0) & (ui < sw) & (vi >= 0) & (vi < sh)
+    return np.where(ok, vi * sw + ui, -1)
+
+
+def _toward_centre(w, c):
+    t = w + c + 0.5                                   # voxel coordinate: voxel i spans [i, i + 1)
+    return np.where(w < 0, np.floor(t + 1e-4), np.ceil(t - 1e-4) - 1).astype(np.int64)
+
+
+def auto_substeps(squash: float, spacing: float) -> int:
+    """Samples per slice so that consecutive samples are at most one voxel's screen height apart."""
+    return max(2, math.ceil(spacing / max(0.25, squash)))
+
+
 def render_frame(P: Prepared, turn: float) -> dict:
     cfg = P.cfg
     cw, ch = P.cw, P.ch
@@ -252,18 +277,25 @@ def render_frame(P: Prepared, turn: float) -> dict:
     ys = (np.arange(ch + P.maxlift + 1)[:, None] - gy) / cfg.squash
     u = c * xs + s * ys
     v = -s * xs + c * ys
-    ui = np.floor(u + cx + 0.5 + 1e-4).astype(np.int64)
-    vi = np.floor(v + cy + 0.5 + 1e-4).astype(np.int64)
-    ok = (ui >= 0) & (ui < sw) & (vi >= 0) & (vi < sh)
-    ofs = np.where(ok, vi * sw + ui, -1)
+    ofs = _source_offsets(u, v, cx, cy, sw, sh)
+
+    # each slice is a slab: sample it at `substeps` fractional heights z + k/n (lift + k/n * spacing),
+    # lowest first, so thin parts at low pitch do not leave background rows between slices.
+    # One offset map per fractional height; the integer part of the lift stays a row shift.
+    nsub = P.substeps
+    sub_ofs = [ofs]
+    for k in range(1, nsub):
+        ys_k = (np.arange(ch + P.maxlift + 1)[:, None] - gy + k / nsub * cfg.spacing) / cfg.squash
+        sub_ofs.append(_source_offsets(c * xs + s * ys_k, -s * xs + c * ys_k, cx, cy, sw, sh))
 
     idx = np.full((ch, cw), -1, np.int64)
     for z in P.nonempty:
         lf = P.lifts[z]
-        f = ofs[lf:lf + ch]
-        g = np.where(f >= 0, z * S + f, 0)
-        hit = (f >= 0) & P.occ_flat[g]
-        idx[hit] = g[hit]
+        for so in sub_ofs:
+            f = so[lf:lf + ch]
+            g = np.where(f >= 0, z * S + f, 0)
+            hit = (f >= 0) & P.occ_flat[g]
+            idx[hit] = g[hit]
 
     # ground shadow: each slice footprint pushed along the sun on the ground plane
     shadow = np.zeros((ch, cw), bool)
@@ -469,6 +501,11 @@ def main(argv=None):
     ap.add_argument("--scale", type=int, default=4)
     ap.add_argument("--squash", type=float, default=0.6)
     ap.add_argument("--spacing", type=float, default=1.0)
+    ap.add_argument("--pitch", type=float, help="camera pitch in degrees: squash = sin, spacing = cos "
+                    "(overrides --squash and --spacing)")
+    ap.add_argument("--substeps", default="auto",
+                    help="samples per slice: 'auto' = max(2, ceil(spacing / max(0.25, squash))), an integer forces "
+                         "it, 1 = old single-sample output")
     ap.add_argument("--light", type=float, nargs=3, default=(-0.5, 0.5, 0.7),
                     help="lamp in screen space: right, up, toward viewer")
     ap.add_argument("--tones", type=float, nargs=3, default=(-0.3, 0.1, 0.55), help="n.L cuts between ramp steps")
@@ -496,9 +533,21 @@ def main(argv=None):
         src = a.model
     else:
         ap.error("give model.npz or --strip/--count")
+    if a.pitch is not None:
+        assert 0 < a.pitch < 90, "--pitch must be between 0 and 90 degrees"
+        a.squash, a.spacing = math.sin(math.radians(a.pitch)), math.cos(math.radians(a.pitch))
+    if a.substeps == "auto":
+        substeps = 0
+    else:
+        try:
+            substeps = int(a.substeps)
+        except ValueError:
+            ap.error("--substeps must be 'auto' or a positive integer")
+        if substeps < 1:
+            ap.error("--substeps must be 'auto' or a positive integer")
     out = a.out or src.with_name("turntable.gif")
     check = a.check or out.with_name("frames_check.png")
-    cfg = Config(frames=a.frames, squash=a.squash, spacing=a.spacing, scale=a.scale, fps=a.fps,
+    cfg = Config(frames=a.frames, squash=a.squash, spacing=a.spacing, substeps=substeps, scale=a.scale, fps=a.fps,
                  light=tuple(a.light), tone_thresholds=tuple(sorted(a.tones)), normal_blur=a.normal_blur,
                  ao=not a.no_ao, ao_radius=a.ao_radius, ao_thresh=a.ao_thresh, despeckle=not a.no_despeckle,
                  silhouette=not a.no_silhouette, depth_lines=not a.no_depth_lines, depth_thresh=a.depth_thresh,
@@ -512,7 +561,7 @@ def main(argv=None):
     ncol = save_gif(frames, out, cfg.scale, cfg.fps)
     picks = save_check(frames, check, cfg.frames)
     msg = (f"{out} {len(frames)} frames {frames[0].shape[1]}x{frames[0].shape[0]} art px x{cfg.scale}, "
-           f"{ncol} colours | check {check} at frames {picks} | prep {t1 - t0:.1f}s render {t2 - t1:.1f}s")
+           f"{ncol} colours | squash {cfg.squash:.3f} spacing {cfg.spacing:.3f} substeps {P.substeps} | check {check} at frames {picks} | prep {t1 - t0:.1f}s render {t2 - t1:.1f}s")
     if a.debug:
         dpath = Path(a.debug) if isinstance(a.debug, str) else out.with_name(out.stem + "_debug.png")
         save_debug(P, a.debug_angle, dpath)

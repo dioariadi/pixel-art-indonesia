@@ -19,17 +19,18 @@ Eight Indonesian landmarks as rotating pixel art, made with sprite stacking: eac
 
 `models/<name>/` holds:
 
-- `turntable.gif`: the model turning, 48 frames.
+- `turntable.gif`: the model turning, 48 frames, rendered with `tools/stack_render.py`.
 - `slices.png`: the model itself, one strip of slices with the ground slice on the left.
 - `build.py`: builds the voxel grid in NumPy and writes `slices.png`. Six models have this.
 - `views.py` and `views.png` (Monas and Wisma 46 only): these two were drawn as four flat views and carved into slices with the slicer from [danielwh2/sprite-stacking](https://github.com/danielwh2/sprite-stacking). That slicer is not included here.
-- `render_gif.py`: turns `slices.png` into `turntable.gif`.
+- `render_gif.py`: the first, simpler renderer written for that model. Kept for reference; running it overwrites `turntable.gif` with the older look.
 
 `tools/` holds:
 
+- `stack_render.py`: the renderer. It draws each slice as a slab with thickness, so thin parts stay solid when the camera is low, and it adds a dark line where one part sits in front of another. `--pitch 25` sets the camera angle in degrees.
+- `render_all.py`: renders all eight models with `stack_render.py`.
 - `make_grid.py`: tiles every `turntable.gif` into `all-landmarks.gif`.
-- `stack_render.py`: a newer renderer with render-time lighting, contact shadows and inner outlines. The eight models above were rendered with the older `render_gif.py`.
-- `check_model.py` and `compare.py`: checks and side-by-side sheets for the newer renderer.
+- `check_model.py` and `compare.py`: checks on a rendered model, and side-by-side sheets of several GIFs.
 
 ## Run it
 
@@ -44,14 +45,14 @@ python models/borobudur/build.py
 ```
 
 ```bash
-python models/borobudur/render_gif.py --count 56
+python tools/render_all.py
 ```
 
 ```bash
 python tools/make_grid.py
 ```
 
-`render_gif.py` needs `--count` set to the model's slice count from the table above when its default differs.
+`build.py` rebuilds one model's `slices.png`, `render_all.py` renders every model's GIF, and `make_grid.py` rebuilds the grid. Options after `render_all.py` are passed to the renderer, so `python tools/render_all.py --pitch 25` renders all eight from a lower camera.
 
 ## How they were made
 
